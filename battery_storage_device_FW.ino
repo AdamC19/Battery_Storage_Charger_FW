@@ -1,8 +1,7 @@
 #include <SPI.h>
 #include "ads1120.h"
-#include <stdlib.h>
-#include <string.h>
 #include "printf.h"
+#include "inttypes.h"
 
 /* PINS */
 #define VC1_BAL   A5
@@ -28,6 +27,9 @@
 
 #define LED_PIN   A7
 
+#define SW_CLK  13
+#define SW_MOSI 12
+#define SW_MISO 11
 
 /* relay parameters */
 #define RELAY_BREAK_TIME  15
@@ -47,20 +49,25 @@
 #define LI_ION_STORAGE_VOLTAGE  3.8
 #define CELL_SAMPLES            4
 #define CAP_DISCHARGE_DELAY_US  250
-#define CAP_CHARGE_DELAY_US     250
+#define CAP_CHARGE_DELAY_US     1000
 #define ADC_SETTLING_TIME_US    10000
-#define ADC_SAMPLE_PERIOD       1000
+#define ADC_SAMPLE_PERIOD       3030
 #define ADC_FS                  4.096
-#define ADC_COUNTS_FS           65535.0
+#define ADC_COUNTS_FS           32767.0
 #define HI_V_SNS_GAIN           (2.0/12.0)
-#define SCRATCH_BUF_LEN         128
+#define SCRATCH_BUF_LEN         256
 
 
 /* charge modes */
-#define MODE_IDLE       0
-#define MODE_CHARGE     1
-#define MODE_DISCHARGE  2
-#define MODE_NO_BATT    3
+#define MODE_CHECK_BATTERY    0
+#define MODE_CHARGE_INIT      1
+#define MODE_CHARGE           2
+#define MODE_DISCHARGE_INIT   3  
+#define MODE_DISCHARGE        4
+#define MODE_NO_POWER         5
+#define MODE_NO_BATT          6
+#define MODE_BATT_ERR         7
+#define MODE_IDLE             8
 
 #define LED_BLINK_DUR_MS 750
 
@@ -69,13 +76,21 @@
 #define LED_BLINK 2
 
 /* MODE_IDLE loop delay in milliseconds */
-#define IDLE_LOOP_DELAY 250
+#define IDLE_LOOP_DELAY       500
+#define CHECK_BATT_DELAY      100
+#define NO_BATT_LOOP_DELAY    100
+#define BATT_ERR_LOOP_DELAY   100
+#define CHARGE_LOOP_DELAY     250
+#define DISCHARGE_LOOP_DELAY  250
 
 ////////////////////////////////////////////////////////////////////////////////
 //
 //  FUNCTION PROTOTYPES
 //
 ////////////////////////////////////////////////////////////////////////////////
+float zero_offset(uint8_t cell);
+void balance_cells();
+void goto_state(uint8_t next_state);
 void set_cell_shunt(uint8_t cell, uint8_t state);
 void set_mux(uint8_t cell);
 void set_charge_current(float amps);
@@ -86,8 +101,8 @@ float get_cell_voltage(uint8_t cell);
 float get_pwr_node_voltage();
 float get_batt_voltage();
 int find_min(float* values, int size);
-float min(float a, float b);
-void debug(char* str);
+// float min(float a, float b);
+void debug(uint8_t* str);
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -99,11 +114,13 @@ uint8_t scratch_buf[SCRATCH_BUF_LEN];
 uint8_t debug_buf[SCRATCH_BUF_LEN];
 uint8_t ads1120_config[4] = {};
 float vin = 0.0;
+float cell_offsets[6] = {};
 float cells[6] = {}; // cell voltages
-ADS1120 ads(ADC_CS);
+ADS1120 ads(ADC_CS, SW_CLK, SW_MOSI, SW_MISO);
 uint8_t n_cells = MAX_NUM_CELLS; // start by assuming the most cells
 bool allow_charging = true;
 float pack_voltage = 0.0;
+float ideal_voltage = 0.0;
 float batt_voltage = 0.0;
 float pwr_node_voltage = 0.0;
 bool pwr_conn_ok = false;
@@ -113,6 +130,7 @@ float max_chg_current = MAX_CHG_CURRENT;
 float max_dischg_current = MAX_DISCHG_CURRENT;
 float dischg_current = 0.0;
 uint8_t led_mode = LED_OFF; 
+long long chg_dischg_start = 0;
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -120,7 +138,7 @@ uint8_t led_mode = LED_OFF;
 //
 ////////////////////////////////////////////////////////////////////////////////
 void setup() {
-  // put your setup code here, to run once:
+  analogReference(EXTERNAL);
   pinMode(VC1_BAL, OUTPUT);
   pinMode(VC2_BAL, OUTPUT);
   pinMode(VC3_BAL, OUTPUT);
@@ -159,14 +177,16 @@ void setup() {
 
   Serial.begin(115200);
 
-  SPI.begin();
+  debug("--- Li-Ion/LiPo battery storage charger ---");
+  delay(1000);
 
   ads1120_config[0] = ADS1120_MUX_P0_N1 | ADS1120_PGA_GAIN_1 | ADS1120_PGA_BYPASS;
-  ads1120_config[1] = ADS1120_MODE_NORMAL | ADS1120_DR_6 | ADS1120_CM_CONT;
+  ads1120_config[1] = ADS1120_MODE_NORMAL | ADS1120_DR_4 | ADS1120_CM_CONT;
   ads1120_config[2] = ADS1120_VREF_EXT;
   ads1120_config[3] = ADS1120_DRDYM_BOTH;
 
   ads.init(ads1120_config);
+  ads.start_sync();
 
   ads.set_input_mux(ADS1120_MUX_P3_NVSS);
   float weight = 0.1;
@@ -176,6 +196,8 @@ void setup() {
     voltage += weight * ADC_FS * (conv / ADC_COUNTS_FS);
   }
   vin = voltage * 6.0;
+  snprintf(debug_buf, SCRATCH_BUF_LEN, "Vin = %.3f", vin);
+  debug(debug_buf);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -185,166 +207,177 @@ void setup() {
 ////////////////////////////////////////////////////////////////////////////////
 void loop() {
 
-  // read all cell positions
-  int i = 0; // list index
-  for(i = 0; i < MAX_NUM_CELLS; i++){
-    cells[i] = get_cell_voltage(i+1);
-  }
-  snprintf(debug_buf, SCRATCH_BUF_LEN, "CELL VOLTAGES = %.2f, %.2f, %.2f, %.2f, %.2f, %.2f", cells[0], cells[1], cells[2], cells[3], cells[4], cells[5]);
-  debug(debug_buf);
-
-  // find out how many cells we actually have
-  n_cells = 0;
-  i = 0;
-  bool end_reached = false;
-  while(!end_reached){
-    if(i >= 6 || cells[i] < 1.0){
-      // unlikely that there is actually a cell attached here
-      end_reached = true;
-    }else{
-      // else it's likely that there is a cell here
-      // so increment our counter to reflect this
-      n_cells++;
-    }
-    i++;
-  }
-  snprintf(debug_buf, SCRATCH_BUF_LEN, "Number of cells = %d", n_cells);
-  debug(debug_buf);
-
-  // decide whether we need to charge or discharge the pack
-  pack_voltage = 0.0;
-  float ideal = LI_ION_STORAGE_VOLTAGE * n_cells;
-  float margin = ALLOWABLE_CELL_MARGIN * n_cells;
-  for(i = 0; i < n_cells; i++){
-    pack_voltage += cells[i];
-  }
-
-  batt_voltage = get_batt_voltage(); // see what the highest voltage in the pack is
-  
-  if(n_cells == 0){
-    mode = MODE_NO_BATT;
-  }else if(pack_voltage < (batt_voltage - 1.0)){
-    // if sum of all detected cells is less than highest voltage in system, we have a problem
-    // someone probably goofed the battery connections
-    mode = MODE_NO_BATT;
-
-  }else if(pack_voltage < (ideal - margin)){
-    // need to charge up some
-    mode = MODE_CHARGE;
-
-  }else if(pack_voltage > (ideal + margin)){
-    // need to discharge some
-    mode = MODE_DISCHARGE;
-
-  }else{
-    if(cells[find_min(cells, n_cells)] < (LI_ION_STORAGE_VOLTAGE - ALLOWABLE_CELL_MARGIN)){
-      // at least one cell is too low, need to charge
-      mode = MODE_CHARGE;
-      chg_current = 0.1;
-    }else{
-      // no need to charge or discharge
-      mode = MODE_IDLE;
-    }
-    
-  }
-
-  // do things based on charge mode
   switch(mode){
-    case MODE_IDLE:{
-      // battery storage charged
-      debug("mode = IDLE");
-      led_mode = LED_SOLID;
+    case MODE_CHECK_BATTERY:{
+      set_charge_current(0.0);
+      set_discharge_current(0.0);
+
+      // turn off all cell balancing shunts
+      for(uint8_t cell = 0; cell < MAX_NUM_CELLS; cell++){
+        disable_cell_shunt(cell + 1);
+      }
+
+      delay(CHECK_BATT_DELAY);
+
+      // read all cell positions
+      int i = 0; // list index
+      for(i = 0; i < MAX_NUM_CELLS; i++){
+        float total = get_cell_voltage(i+1);
+        delay(10);
+        total += get_cell_voltage(i+1);
+        delay(10);
+        total += get_cell_voltage(i+1);
+        cells[i] = total/3;
+      }
+      snprintf(debug_buf, SCRATCH_BUF_LEN, "CELLS: %.3f,\t%.3f,\t%.3f,\t%.3f,\t%.3f,\t%.3f", cells[0], cells[1], cells[2], cells[3], cells[4], cells[5]);
+      debug(debug_buf);
+
+      // find out how many cells we actually have
+      n_cells = 0;
+      i = 0;
+      bool end_reached = false;
+      while(!end_reached){
+        if(i >= 6 || cells[i] < 1.0){
+          // unlikely that there is actually a cell attached here
+          end_reached = true;
+        }else{
+          // else it's likely that there is a cell here
+          // so increment our counter to reflect this
+          n_cells++;
+        }
+        i++;
+      }
+
+      // calculate pack voltage from individual cell voltages
+      pack_voltage = 0.0;
+      ideal_voltage = LI_ION_STORAGE_VOLTAGE * n_cells;
+      float margin = ALLOWABLE_CELL_MARGIN * n_cells;
+      for(i = 0; i < n_cells; i++){
+        pack_voltage += cells[i];
+      }
+
+      batt_voltage = get_batt_voltage(); // see what the highest voltage in the pack is
+
+      // makes sure the battery is connected to the power terminals 
+      pwr_node_voltage = get_pwr_node_voltage();
+      if(pwr_node_voltage <= (batt_voltage - 1.0) || pwr_node_voltage <= pack_voltage - 1.0){
+        // battery is likely not connected to power terminals yet
+      }
+
+      // snprintf(debug_buf, SCRATCH_BUF_LEN, "Cells = %d;\tBatt_Voltage = %.3fV;\tPack Voltage = %.3fV;\tPwr Node V = %.2fV", n_cells, batt_voltage, pack_voltage, pwr_node_voltage);
+      // debug(debug_buf);
+
+      if(n_cells == 0){
+        // if no cells detected, we don't care about anything else
+        mode = MODE_NO_BATT;
+      }else if(pack_voltage < (batt_voltage - 1.5)){
+        // if sum of all detected cells is significantly less than highest voltage in system, we have a problem
+        // someone probably goofed the battery connections
+        mode = MODE_BATT_ERR;
+      }else if(pack_voltage < (ideal_voltage - margin)){
+        mode = MODE_CHARGE_INIT;    // need to charge up some
+      }else if(pack_voltage > (ideal_voltage + margin)){
+        mode = MODE_DISCHARGE_INIT; // need to discharge some
+      }else if(cells[find_min(cells, n_cells)] < (LI_ION_STORAGE_VOLTAGE - ALLOWABLE_CELL_MARGIN)){
+        mode = MODE_CHARGE_INIT;    // at least one cell is too low, need to charge
+      }else{
+        mode = MODE_IDLE;      // no need to charge or discharge
+      }
+
+      break;
+    }case MODE_IDLE:{
       set_discharge_current(0.0);
       set_charge_current(0.0);
       digitalWrite(RELAY, LOW); // open the relay
       delay(RELAY_BREAK_TIME);
+      led_mode = LED_SOLID;
       delay(IDLE_LOOP_DELAY);
+      mode = MODE_CHECK_BATTERY;
       break;
-    }case MODE_CHARGE:{
-      led_mode = LED_BLINK;
-      set_discharge_current(0.0);
-      digitalWrite(RELAY, HIGH); // close the relay
-      delay(RELAY_MAKE_TIME); // wait for it to actuate
-      delay(20); // additional settling time
 
-      pwr_node_voltage = get_pwr_node_voltage();
-      if(pwr_node_voltage >= batt_voltage && pwr_node_voltage >= pack_voltage - 1.0){
-        // makes sure the battery is connected to the power terminals 
-        // see how much current we can draw for our rated power, or just the absolute max we set above
-        max_chg_current = min(MAX_CHG_CURRENT, MAX_MOSFET_PWR/(24 - pack_voltage));
-        
-        // calculate charge current based on error
-        if((chg_current = (ideal - pack_voltage)) > max_chg_current){
-          chg_current = max_chg_current;
-        }
-        if(allow_charging){
-          snprintf(debug_buf, SCRATCH_BUF_LEN, "Charging at %.3fA", chg_current);
-          debug(debug_buf);
-          set_charge_current(chg_current);
-        }else{
-          debug("Charging not allowed.");
-          set_charge_current(0.0);
-        }
-      }else{
-        debug("Battery not connected to power terminals.");
-        set_charge_current(0.0); // battery not connected to power terminals, so no attempting to set charge current
-      }
-      
-      break;
-    }case MODE_DISCHARGE:{
-      led_mode = LED_BLINK;
-      set_charge_current(0.0);
-      digitalWrite(RELAY, HIGH); // close the relay
-      delay(RELAY_MAKE_TIME); // wait for it to actuate
-      delay(20); // additional settling time
-      
-      pwr_node_voltage = get_pwr_node_voltage();
-      if(pwr_node_voltage >= batt_voltage && pwr_node_voltage >= pack_voltage - 1.0){
-        // makes sure the battery is connected to the power terminals 
-
-        // see how much current we can sink for our rated power, or just the absolute max we set above
-        max_dischg_current = min(MAX_DISCHG_CURRENT, MAX_MOSFET_PWR/pack_voltage);
-        
-        // calculate discharge current
-        if((dischg_current = (ideal - pack_voltage)) > max_dischg_current){
-          dischg_current = max_dischg_current;
-        }
-        snprintf(debug_buf, SCRATCH_BUF_LEN, "Discharging at %.3fA", dischg_current);
-        debug(debug_buf);
-        set_discharge_current(dischg_current);
-      }else{
-        debug("Battery not connected to power terminals.");
-        set_discharge_current(0.0); // battery not connected to power terminals, so no attempting to discharge
-      }
-      
+    }case MODE_BATT_ERR:{
+      debug("Battery error...");
+      led_mode = LED_OFF;
+      delay(BATT_ERR_LOOP_DELAY);
+      mode = MODE_CHECK_BATTERY;
       break;
     }case MODE_NO_BATT:{
-      debug("Battery not detected...");
+      debug("No battery detected...");
       led_mode = LED_OFF;
-      set_discharge_current(0.0);
-      set_charge_current(0.0);
       digitalWrite(RELAY, LOW); // open the relay
       delay(RELAY_BREAK_TIME);
-      delay(IDLE_LOOP_DELAY);
-    }
-    default:{
-      mode = MODE_IDLE;
+      delay(NO_BATT_LOOP_DELAY);
+      mode = MODE_CHECK_BATTERY;
+      break;
+
+    }case MODE_CHARGE_INIT:{
+      set_discharge_current(0.0);
+      digitalWrite(RELAY, HIGH); // close the relay
+      delay(RELAY_MAKE_TIME); // wait for it to actuate
+      delay(20); // additional settling time
+      led_mode = LED_BLINK;
+      mode = MODE_CHARGE;
+      break;
+
+    }case MODE_CHARGE:{
+      // see how much current we can draw for our rated power, or just the absolute max we set above
+      max_chg_current = min(MAX_CHG_CURRENT, MAX_MOSFET_PWR/(24 - pack_voltage));
+      
+      // calculate charge current based on error
+      if((chg_current = (ideal_voltage - pack_voltage)) > max_chg_current){
+        chg_current = max_chg_current;
+      }
+      if(allow_charging){
+        snprintf(debug_buf, SCRATCH_BUF_LEN, "Charging at %.3fA", chg_current);
+        debug(debug_buf);
+  
+        set_charge_current(chg_current);
+      }else{
+        debug("Charging not allowed.");
+        set_charge_current(0.0);
+      }
+
+      balance_cells();
+
+      delay(CHARGE_LOOP_DELAY);
+
+      mode = MODE_CHECK_BATTERY;
+
+      break;
+    }case MODE_DISCHARGE_INIT:{
+      set_charge_current(0.0);
+      digitalWrite(RELAY, HIGH); // close the relay
+      delay(RELAY_MAKE_TIME); // wait for it to actuate
+      led_mode = LED_BLINK;
+      mode = MODE_DISCHARGE;
+      break;
+
+    }case MODE_DISCHARGE:{
+      // see how much current we can sink for our rated power, or just the absolute max we set above
+      max_dischg_current = min(MAX_DISCHG_CURRENT, MAX_MOSFET_PWR/pack_voltage);
+      
+      // calculate discharge current
+      if((dischg_current = (ideal_voltage - pack_voltage)) > max_dischg_current){
+        dischg_current = max_dischg_current;
+      }
+      
+      snprintf(debug_buf, SCRATCH_BUF_LEN, "Discharging at %.3fA", chg_current);
+      debug(debug_buf);
+      set_discharge_current(dischg_current);
+
+      balance_cells();
+
+      delay(DISCHARGE_LOOP_DELAY);
+
+      mode = MODE_CHECK_BATTERY;
+      
+      break;
+    }default:{
+      mode = MODE_CHECK_BATTERY;
       break;
     }
   }
-
-  // CELL BALANCING
-  // do this regardless of the charge mode
-  // we only have the capability to drop the cell voltages, so find which cells 
-  // are too high and enable the shunt network
-  for(i = 0; i < n_cells; i++){
-    if(cells[i] > LI_ION_STORAGE_VOLTAGE + ALLOWABLE_CELL_MARGIN){
-      enable_cell_shunt(i+1);
-      allow_charging |= cells[i] < LI_ION_MAX_CELL_VOLTAGE;
-    }else{
-      disable_cell_shunt(i+1);
-    }
-  }
+  
 
   switch(led_mode){
     case LED_OFF:
@@ -354,11 +387,15 @@ void loop() {
       digitalWrite(LED_PIN, HIGH);
       break;
     case LED_BLINK:
-      if(((millis()/LED_BLINK_DUR_MS) % 2) == 1){
+      if(((millis()/LED_BLINK_DUR_MS) % 2) == 0){
         digitalWrite(LED_PIN, HIGH);
       }else{
         digitalWrite(LED_PIN, LOW);
       }
+      break;
+    default:
+      led_mode = LED_OFF;
+      break;
   }
 }
 
@@ -367,12 +404,74 @@ void loop() {
 //  FUNCTION DEFINITIONS
 //
 ////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * 
+ */
+void balance_cells(){
+  // we only have the capability to drop the cell voltages, so find which cells 
+  // are too high and enable the shunt network
+  for(uint8_t i = 0; i < n_cells; i++){
+    if(cells[i] > LI_ION_STORAGE_VOLTAGE + ALLOWABLE_CELL_MARGIN){
+      enable_cell_shunt(i+1);
+      allow_charging |= cells[i] < LI_ION_MAX_CELL_VOLTAGE;
+    }else{
+      disable_cell_shunt(i+1);
+    }
+  }
+}
+
+
+void goto_state(uint8_t next_state){
+  switch(next_state){
+    case MODE_CHECK_BATTERY:{
+      set_discharge_current(0.0);
+      set_charge_current(0.0);
+      break;
+    }
+    case MODE_NO_BATT:{
+      led_mode = LED_OFF;
+      set_discharge_current(0.0);
+      set_charge_current(0.0);
+      digitalWrite(RELAY, LOW); // open the relay
+      delay(RELAY_BREAK_TIME);
+      break;
+    }case MODE_IDLE:{
+      led_mode = LED_SOLID;
+      set_discharge_current(0.0);
+      set_charge_current(0.0);
+      digitalWrite(RELAY, LOW); // open the relay
+      delay(RELAY_BREAK_TIME);
+      break;
+    }case MODE_CHARGE:{
+      led_mode = LED_BLINK;
+      set_discharge_current(0.0);
+      digitalWrite(RELAY, HIGH); // close the relay
+      delay(RELAY_MAKE_TIME); // wait for it to actuate
+      delay(20); // additional settling time
+      chg_dischg_start = millis();
+      break;
+    }case MODE_DISCHARGE:{
+      led_mode = LED_BLINK;
+      set_charge_current(0.0);
+      digitalWrite(RELAY, HIGH); // close the relay
+      delay(RELAY_MAKE_TIME); // wait for it to actuate
+      delay(20); // additional settling time
+      chg_dischg_start = millis();
+      break;
+    }default:{
+      break;
+    }
+  }
+  mode = next_state;
+}
+
 void disable_cell_shunt(uint8_t cell){
-  set_cell_shunt(cell, HIGH);
+  set_cell_shunt(cell, LOW);
 }
 
 void enable_cell_shunt(uint8_t cell){
-  set_cell_shunt(cell, LOW);
+  set_cell_shunt(cell, HIGH);
 }
 
 void set_cell_shunt(uint8_t cell, uint8_t state){
@@ -414,6 +513,11 @@ void set_charge_current(float amps){
 }
 
 void set_discharge_current(float amps){
+  if(amps > 0.0){
+    snprintf(debug_buf, SCRATCH_BUF_LEN, "Setting discharge current to %.3f A", amps);
+    debug(debug_buf);
+  }
+  
   int value = (int)(( (4.4*amps)/5.0 )*255.0 + 0.5);
   analogWrite(PWM_SINK, value);
 }
@@ -425,6 +529,7 @@ float get_cell_voltage(uint8_t cell){
   if(cell > 6){
     return 0.0;
   }
+  disable_cell_shunt(cell); // disable balancing on this cell
 
   // zero the flying capacitor
   digitalWrite(ZERO_CAP, HIGH);
@@ -446,7 +551,7 @@ float get_cell_voltage(uint8_t cell){
 
   // disable mux
   digitalWrite(EN_MUX, LOW);
-  delayMicroseconds(1);
+  // delayMicroseconds(1);
 
   // set the mux to 0
   set_mux(0);
@@ -458,24 +563,25 @@ float get_cell_voltage(uint8_t cell){
   // close the READ switches
   digitalWrite(READ, HIGH);
 
+  // set the ADC mux
+  ads.set_input_mux(ADS1120_MUX_P0_N1);
+
   // allow ADC to settle and acquire a good sample
   delayMicroseconds(ADC_SETTLING_TIME_US);
 
   // get conversion(s) from ADS1120
-  uint32_t total = 0;
-  uint16_t values[CELL_SAMPLES];
+  float retval = 0.0;
   for(int i = 0; i < CELL_SAMPLES; i++){
-    values[i] = ads.get_conv();
-    total += values[i];
     delayMicroseconds(ADC_SAMPLE_PERIOD);
+    float tmp = ADC_FS * ((float)ads.get_conv()/ADC_COUNTS_FS);
+    retval += tmp;
   }
-  float raw_value = (float)(total/CELL_SAMPLES);
-  float retval = ADC_FS * (raw_value/ADC_COUNTS_FS);
+  retval = retval / CELL_SAMPLES;
 
   // open the READ switches
   digitalWrite(READ, LOW);
 
-  return retval;
+  return retval - cell_offsets[cell-1];
 }
 
 /**
@@ -500,13 +606,11 @@ float get_pwr_node_voltage(){
 float get_batt_voltage(){
   ads.set_input_mux(ADS1120_MUX_P2_NVSS);
 
-  uint32_t total = 0;
+  float retval = 0.0;
   for(int i = 0; i < 4; i++){
     delayMicroseconds(ADC_SAMPLE_PERIOD);
-    total += ads.get_conv();
+    retval += 0.25 * ADC_FS * (float)ads.get_conv()/ADC_COUNTS_FS;
   }
-  float retval = (float)(total/4);
-  retval = ADC_FS * (retval/ADC_COUNTS_FS);
   return retval / HI_V_SNS_GAIN;
 }
 
@@ -521,24 +625,21 @@ int find_min(float* values, int size){
   return min_ind;
 }
 
-float min(float a, float b){
-  if(a < b){
-    return a;
-  }else{
-    return b;
-  }
-}
+// float min(float a, float b){
+//   if(a < b){
+//     return a;
+//   }else{
+//     return b;
+//   }
+// }
 
 /**
  * @brief print str along with current timestamp. Does a safety check to make sure we can write to the buffer
  */
-void debug(char* str){
-  int write_len = Serial.availableForWrite();
+void debug(uint8_t* str){
   seconds = millis()/1000.0;
-  snprintf(scratch_buf, SCRATCH_BUF_LEN, "[%10.3f] %s\r\n", str);
+  snprintf(scratch_buf, SCRATCH_BUF_LEN, "[%10.3f] %s\r\n", seconds, str);
   int len = strlen(scratch_buf);
-  if(write_len > len){
-    len = write_len;
-  }
+  
   Serial.write(scratch_buf, len);
 }

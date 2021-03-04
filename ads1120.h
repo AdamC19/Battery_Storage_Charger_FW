@@ -2,7 +2,7 @@
 #define _ADS1120_H_
 
 #include "Arduino.h"
-#include <SPI.h>
+#include "SoftwareSPI.h"
 
 
 #define ADS1120_SPI_MODE  SPI_MODE_1
@@ -98,12 +98,13 @@
 
 class ADS1120 {
     int cs_pin;
-    SPISettings spi_settings;
+    SwSPI spibus;
 public:
-    ADS1120(int cs_pin);
-    void init();
+    ADS1120(int cs_pin, int clk, int mosi, int miso);
+    void init(uint8_t* configs);
     void reset();
-    uint16_t get_conv();
+    void start_sync();
+    int16_t get_conv();
     void set_input_mux(uint8_t config);
 };
 
